@@ -1,0 +1,113 @@
+rules_version = '2';
+
+// Deploy with:  firebase deploy --only firestore:rules
+// or paste into Firebase console > Firestore > Rules.
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function isAdmin() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Creator whose profile an admin has approved (admin -> Approvals).
+    function isApprovedCreator() {
+      return signedIn()
+        && exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.get("status", "") == "approved";
+    }
+
+    // Fields only an admin may write.
+    function reviewFields() {
+      return ["reviewNote", "reviewedBy", "reviewedAt", "approvedAt"];
+    }
+
+    // A creator may keep their approval status, or set it to "pending"
+    // (submitting / re-submitting the enrolment form). Never "approved".
+    function statusOk(before, after) {
+      return after.get("status", "none") == before.get("status", "none")
+        || after.get("status", "none") == "pending";
+    }
+
+    // users/{uid}: email, role, name, phone, phoneVerified, city, niches,
+    // platforms, totalFollowers, topFollowers, tier, enrolled,
+    // status ("pending" | "approved" | "rejected"), reviewNote, reviewedBy,
+    // reviewedAt, createdAt, submittedAt, enrolledAt, updatedAt
+    match /users/{uid} {
+      allow read: if isSelf(uid) || isAdmin();
+
+      // A user can create their own doc, but only as a creator and never
+      // pre-approved. (Admins are set by hand in the Firebase console.)
+      allow create: if isSelf(uid)
+        && request.resource.data.role == "creator"
+        && request.resource.data.get("status", "pending") == "pending"
+        && !request.resource.data.keys().hasAny(reviewFields());
+
+      // A user can edit their own doc but never change their role (so nobody
+      // can promote themselves to admin) and never approve themselves.
+      // Admins can edit anyone. Old "brand" accounts (from before the brand
+      // side was removed) may switch themselves to "creator", nothing else.
+      allow update: if isAdmin()
+        || (isSelf(uid)
+            && request.resource.data.role == resource.data.role
+            && statusOk(resource.data, request.resource.data)
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(reviewFields()))
+        || (isSelf(uid) && resource.data.role == "brand" && request.resource.data.role == "creator"
+            && statusOk(resource.data, request.resource.data)
+            && !request.resource.data.diff(resource.data).affectedKeys().hasAny(reviewFields()));
+
+      allow delete: if isAdmin();
+
+      // users/{uid}/socialAccounts/{platform}: handle, followers, verified, source
+      match /socialAccounts/{platform} {
+        allow read: if isSelf(uid) || isAdmin();
+        // Creators can't mark their own accounts as verified.
+        allow create, update: if isAdmin()
+          || (isSelf(uid) && request.resource.data.verified == false);
+        allow delete: if isSelf(uid) || isAdmin();
+      }
+    }
+
+    // Admin "Social Accounts" page lists every creator's linked accounts with
+    // one collection-group query, which needs this wildcard read rule.
+    match /{path=**}/socialAccounts/{platform} {
+      allow read: if isAdmin();
+    }
+
+    // ads/{adId}: brand, title, category, platforms, minFollowers,
+    // maxFollowers (null = no limit), brief, budget, deadline ("YYYY-MM-DD"),
+    // format, mediaUrl (optional video / sample link),
+    // status ("active" | "paused"), createdBy, createdAt, updatedAt.
+    // Posted and edited by admins from /admin, read by APPROVED creators only.
+    function validAd(d) {
+      return d.brand is string && d.brand.size() > 0 && d.brand.size() <= 80
+        && d.title is string && d.title.size() > 0 && d.title.size() <= 100
+        && d.category is string
+        && d.platforms is list && d.platforms.size() > 0
+        && d.platforms.hasOnly(["instagram", "facebook", "youtube"])
+        && d.minFollowers is int && d.minFollowers >= 0
+        && (d.maxFollowers == null || (d.maxFollowers is int && d.maxFollowers > d.minFollowers))
+        && d.brief is string && d.brief.size() <= 1500
+        && (d.budget is int || d.budget is float) && d.budget > 0
+        && d.deadline is string && d.deadline.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && d.status in ["active", "paused"]
+        && (!("format" in d) || (d.format is string && d.format.size() <= 40))
+        && (!("mediaUrl" in d) || (d.mediaUrl is string && d.mediaUrl.size() <= 500));
+    }
+
+    match /ads/{adId} {
+      allow read: if isAdmin() || isApprovedCreator();
+      allow create, update: if isAdmin() && validAd(request.resource.data);
+      allow delete: if isAdmin();
+    }
+  }
+}
